@@ -82,10 +82,12 @@ export function createViewMemoryTool(): Tool<MemoryToolDeps> {
     name: "view_memory",
     disclosure: "private",
     description:
-      "Call this first, before you answer, at the start of every conversation — even a casual one. " +
-      "Calling it with no path is the whole survey: it returns every memory scope you can access " +
+      "Consult memory when the request may depend on prior preferences, decisions, relationships, " +
+      "or work from another conversation. Skip it when prior context cannot improve the answer. " +
+      "Memory is split into scopes by subject; inspect only scopes relevant to the conversation. " +
+      "Calling it with no path returns every memory scope you can access " +
       '(e.g. "personal", "github-project-a") and the files saved in each, with sizes, so one call tells you ' +
-      "whether there is anything worth reading. " +
+      "where relevant memory may live when the right scope is unclear. " +
       'A path like "personal/notes.md" then reads one file. ' +
       "An empty or missing directory just means nothing has been saved yet — that is a normal answer, not an error.",
     parameters: viewMemoryParameters,
@@ -210,10 +212,12 @@ export function createManageMemoryTool(): Tool<MemoryToolDeps> {
     name: "manage_memory",
     disclosure: "private",
     description:
-      "Save facts that will still matter later — preferences, location, age, how they like to work, project-specific notes. Write as soon as you learn it. " +
-      'Every path starts with a scope name (e.g. "personal/preferences.md", "github-project-a/status.md") — call view_memory with no path to see which scopes you can access. ' +
-      "Update an existing file instead of creating a new one for the same topic — call view_memory first. One file per topic within a scope, not a running log. " +
-      "Rewrite anything that is no longer true. Never write small talk, this-task details, or secrets (account numbers, passwords, health data). " +
+      "Save user-confirmed, durable information likely to improve a future conversation, such as " +
+      "preferences, recurring facts, and standing project decisions. Do not save small talk, " +
+      "temporary task state, tentative thoughts, sensitive personal data, or secrets. Every path " +
+      'starts with a relevant scope name (e.g. "personal/preferences.md" or "github-project-a/conventions.md"); ' +
+      "list scopes with view_memory only when the correct scope is unclear. Read the relevant file " +
+      "before changing it, keep one file per topic rather than a running log, and replace stale facts. " +
       "Commands: create(path, file_text) makes a new file, errors if it already exists; " +
       "str_replace(path, old_str, new_str) replaces one exact, unique snippet — omit new_str to delete it; " +
       "insert(path, insert_line, insert_text) inserts text after a 0-based line (0 = start of file); " +

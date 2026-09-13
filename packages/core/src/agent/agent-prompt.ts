@@ -11,17 +11,8 @@ import type { AttachmentKind, MessageAttachment } from "@/core/types/attachment"
 import type { ChatMessage, ConversationMessages } from "@/core/types/message";
 import { systemInfo } from "@/core/utils/system-info";
 import { renderProjectInstructions, type ProjectInstructionFile } from "./project-instructions";
-import {
-  COMPLETION_INSTRUCTIONS,
-  ENVIRONMENT_TEMPLATE,
-  MEDIA_GENERATION_DELEGATED,
-  MEDIA_GENERATION_UNAVAILABLE,
-  MEMORY_INSTRUCTIONS,
-  SKILLS_INSTRUCTIONS,
-  TASK_STATE_INSTRUCTIONS,
-  TOOL_SEARCH_INSTRUCTIONS,
-  TOOL_SELECTION_INSTRUCTIONS,
-} from "./prompts/shared";
+import { renderPromptLayers, type PromptSection } from "./prompts/layers";
+import { ENVIRONMENT_TEMPLATE, renderHarnessPrompt } from "./prompts/shared";
 import { collectUserInputAttachments } from "./user-input-attachments";
 
 /**
@@ -172,19 +163,6 @@ function getSkillIndexLineFromOption(s: {
   return desc;
 }
 
-function formatPersonaVoice(persona: AgentPersona): string {
-  return [
-    persona.tone && persona.tone.trim().length > 0 ? `tone ${persona.tone.trim()}` : "",
-    persona.style && persona.style.trim().length > 0 ? `style ${persona.style.trim()}` : "",
-  ]
-    .filter((part) => part.length > 0)
-    .join(", ");
-}
-
-function renderVoiceReminder(voice: string): string {
-  return `\n\n# Voice\n\nThis persona speaks in a specific register — ${voice}. Hold it in every reply, including the last one of a long run, and where it conflicts with the generic formatting habits above, the persona's voice wins. Never break character to announce the register; just use it.\n`;
-}
-
 export class AgentPromptBuilder {
   private systemPromptCache = new Map<string, string>();
 
@@ -215,20 +193,18 @@ export class AgentPromptBuilder {
 
   /**
    * Compute a cache key for system prompt based on inputs that affect the output.
-   * Includes the persona's system prompt content and voice fields so edits to
-   * custom personas are reflected immediately without waiting for a restart.
+   * Includes the persona's system prompt content so edits to custom personas
+   * are reflected immediately without waiting for a restart.
    * Includes date string to invalidate daily (since prompts include current date).
    */
   private computeSystemPromptCacheKey(
     personaName: string,
     options: AgentPromptOptions,
     personaSystemPrompt: string,
-    personaVoice: string,
   ): string {
     const hash = createHash("md5");
     hash.update(personaName);
     hash.update(personaSystemPrompt);
-    hash.update(personaVoice);
     hash.update(options.agentName);
     hash.update(options.agentDescription);
     if (options.knownSkills && options.knownSkills.length > 0) {
@@ -330,13 +306,10 @@ export class AgentPromptBuilder {
         // Resolve persona first so its content is included in the cache key.
         // This ensures edits to custom personas invalidate the cache immediately.
         const persona = yield* this.resolvePersona(personaName, personaService);
-        const voice = formatPersonaVoice(persona);
-
         const cacheKey = this.computeSystemPromptCacheKey(
           personaName,
           options,
           persona.systemPrompt,
-          voice,
         );
         const cached = this.systemPromptCache.get(cacheKey);
         if (cached) return cached;
@@ -354,9 +327,13 @@ export class AgentPromptBuilder {
             .replace("{username}", username)
             .replace("{tty}", tty);
 
-        let systemPrompt = persona.systemPrompt
+        let personaPrompt = persona.systemPrompt
           .replace("{agentName}", options.agentName)
           .replace("{agentDescription}", options.agentDescription);
+
+        const core: PromptSection[] = [];
+        const scope: PromptSection[] = [];
+        const live: PromptSection[] = [];
 
         if (personaName !== "summarizer") {
           const envBlock = fillEnvironment(ENVIRONMENT_TEMPLATE);
@@ -369,79 +346,53 @@ export class AgentPromptBuilder {
             "{hostname}",
             "{username}",
             "{tty}",
-          ].some((placeholder) => systemPrompt.includes(placeholder));
-          systemPrompt = fillEnvironment(systemPrompt);
-          if (systemPrompt.includes("{environment}")) {
-            systemPrompt = systemPrompt.replace("{environment}", envBlock);
+          ].some((placeholder) => personaPrompt.includes(placeholder));
+          personaPrompt = fillEnvironment(personaPrompt);
+          if (personaPrompt.includes("{environment}")) {
+            personaPrompt = personaPrompt.replace("{environment}", envBlock);
           } else if (!usesIndividualEnvironmentFields) {
-            systemPrompt = `${systemPrompt}\n${envBlock}`;
+            live.push({ id: "environment", content: envBlock });
           }
         }
 
-        // Only for models that cannot generate media, and never for the summarizer, which has no
-        // user to advise. Which line depends on whether delegation is on the table: an agent
-        // holding generate_media should reach for it, not send the user to another agent.
-        if (personaName !== "summarizer" && options.canGenerateMedia === false) {
-          const canDelegate = options.toolNames?.includes("generate_media") === true;
-          systemPrompt = `${systemPrompt}\n${canDelegate ? MEDIA_GENERATION_DELEGATED : MEDIA_GENERATION_UNAVAILABLE}`;
-        }
+        core.push({ id: "persona", content: personaPrompt });
 
-        // Every acting persona gets the completion contract. The summarizer is
-        // a pure transcript-compression role with no tools — "finish the job"
-        // framing is noise for it.
         if (personaName !== "summarizer") {
-          systemPrompt = systemPrompt + COMPLETION_INSTRUCTIONS;
-        }
-
-        if (options.toolNames && options.toolNames.length > 0) {
-          systemPrompt = systemPrompt + TOOL_SELECTION_INSTRUCTIONS;
-        }
-
-        if (options.knownSkills && options.knownSkills.length > 0) {
-          // Compact index — one line per skill. Full descriptions are loaded
-          // JIT via the `find_skills` tool. This keeps system-prompt overhead
-          // bounded as the skill catalog grows.
-          const indexLines = options.knownSkills
-            .map((s) => `- ${s.name}: ${getSkillIndexLineFromOption(s)}`)
+          const skillsIndex = options.knownSkills
+            ?.map((skill) => `- ${skill.name}: ${getSkillIndexLineFromOption(skill)}`)
             .join("\n");
-
-          const skillsSection = `
-${SKILLS_INSTRUCTIONS}
-<available_skills>
-${indexLines}
-</available_skills>`;
-          systemPrompt = systemPrompt + skillsSection;
-        }
-
-        if (options.deferredTools && options.deferredTools.length > 0) {
-          const indexLines = options.deferredTools
-            .map((t) => `- ${t.name}: ${t.summary}`)
+          const deferredToolsIndex = options.deferredTools
+            ?.map((tool) => `- ${tool.name}: ${tool.summary}`)
             .join("\n");
+          const media =
+            options.canGenerateMedia === false
+              ? options.toolNames?.includes("generate_media") === true
+                ? "delegated"
+                : "unavailable"
+              : undefined;
 
-          systemPrompt = `${systemPrompt}
-${TOOL_SEARCH_INSTRUCTIONS}
-<deferred_tools>
-${indexLines}
-</deferred_tools>`;
+          core.push({
+            id: "harness",
+            content: renderHarnessPrompt({
+              hasTools: (options.toolNames?.length ?? 0) > 0,
+              hasShell: options.toolNames?.includes("execute_command") === true,
+              hasSubagents: options.toolNames?.includes("spawn_subagent") === true,
+              hasToolResultRetrieval: options.toolNames?.includes("retrieve_tool_result") === true,
+              ...(skillsIndex ? { skillsIndex } : {}),
+              ...(deferredToolsIndex ? { deferredToolsIndex } : {}),
+              ...(media ? { media } : {}),
+            }),
+          });
+
+          if (options.projectInstructions && options.projectInstructions.length > 0) {
+            scope.push({
+              id: "project-instructions",
+              content: renderProjectInstructions(options.projectInstructions),
+            });
+          }
         }
 
-        if (options.toolNames?.includes("view_memory")) {
-          systemPrompt = systemPrompt + MEMORY_INSTRUCTIONS;
-        }
-
-        if (options.toolNames?.includes("update_work_state")) {
-          systemPrompt = systemPrompt + TASK_STATE_INSTRUCTIONS;
-        }
-
-        // Last, so project rules read as the most recent instruction the model
-        // has before the conversation itself.
-        if (options.projectInstructions && options.projectInstructions.length > 0) {
-          systemPrompt = systemPrompt + renderProjectInstructions(options.projectInstructions);
-        }
-
-        if (personaName !== "summarizer" && voice.length > 0) {
-          systemPrompt = systemPrompt + renderVoiceReminder(voice);
-        }
+        const systemPrompt = renderPromptLayers({ core, scope, live });
 
         // Cache the result
         this.systemPromptCache.set(cacheKey, systemPrompt);
