@@ -471,11 +471,19 @@ export class ChatServiceImpl implements ChatService {
           // Use a getter for autoApprovePolicy to support real-time mode switches via Shift+Tab
           const getCurrentAutoApprovePolicy = () => autoApprovePolicy;
 
+          // Set only when this turn fails: what it had done by then. Without it a failed LLM
+          // request reverts to the history from before the turn, and "continue" reaches a
+          // model that has no idea what it was working on.
+          let failedTurnMessages: ChatMessage[] | undefined;
+
           const runnerOptions: AgentRunnerOptions = {
             agent,
             userInput: messageForAgent,
             conversationId,
             conversationHistory,
+            onFailedTurn: (messages) => {
+              failedTurnMessages = [...messages];
+            },
             ...(options?.stream !== undefined ? { stream: options.stream } : {}),
             ...(options?.maxIterations !== undefined
               ? { maxIterations: options.maxIterations }
@@ -589,12 +597,18 @@ export class ChatServiceImpl implements ChatService {
                 } else {
                   yield* terminal.error(`Error: ${String(error)}`);
                 }
+                if (failedTurnMessages !== undefined) {
+                  yield* terminal.log(
+                    "   The work from this turn is kept: send a message to pick up where it stopped.",
+                  );
+                }
                 yield* terminal.log("");
 
-                // Return a minimal response to allow the loop to continue
+                // Return a minimal response to allow the loop to continue. A failed turn hands
+                // back what it had done by then, so that work stays in the history.
                 return {
                   conversationId: conversationId || "",
-                  messages: conversationHistory,
+                  messages: failedTurnMessages ?? conversationHistory,
                   content: "",
                 };
               }),
@@ -662,7 +676,9 @@ export class ChatServiceImpl implements ChatService {
             loggedMessageCount += 1;
           }
 
-          if (!lastTurnErrored) {
+          // A failed turn that handed back its work is saved like any other, so the work
+          // survives a restart as well as the next message.
+          if (!lastTurnErrored || failedTurnMessages !== undefined) {
             yield* persistConversationIfNeeded({
               ephemeral,
               conversationHistory,

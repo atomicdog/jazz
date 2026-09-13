@@ -517,9 +517,13 @@ function finalizeRun(
 /**
  * Close out assistant `tool_calls` that never got a `role: "tool"` result so the
  * transcript stays valid for the next LLM request. Used when the user interrupts
- * mid-batch: executeToolCalls fails before handleToolPhase can append results.
+ * mid-batch (executeToolCalls fails before handleToolPhase can append results), and
+ * on a copy of the transcript when a turn fails outright.
  */
-function closeDanglingToolCalls(state: LoopState): void {
+function closeDanglingToolCalls(
+  state: Pick<LoopState, "currentMessages">,
+  content = "Tool execution interrupted by user",
+): void {
   const lastAssistant = [...state.currentMessages]
     .reverse()
     .find((message) => message.role === "assistant" && (message.tool_calls?.length ?? 0) > 0);
@@ -536,10 +540,43 @@ function closeDanglingToolCalls(state: LoopState): void {
     state.currentMessages.push({
       role: "tool",
       name: toolCall.function.name,
-      content: "Tool execution interrupted by user",
+      content,
       tool_call_id: toolCall.id,
     });
   }
+}
+
+/** The result a dangling tool call is closed with when its turn failed before it returned. */
+const FAILED_TURN_TOOL_RESULT =
+  "Tool execution did not finish: the run failed before this tool returned a result.";
+
+/**
+ * Hand a failed turn's transcript to the caller before the failure unwinds it.
+ *
+ * The caller otherwise holds only the history it passed in, so one failed LLM request
+ * erased the whole turn: the user's message and every tool call and result, however many
+ * iterations deep. The next "continue" then reached a model with no idea what it had been
+ * doing. The copy has its dangling tool calls closed, so it is valid to send as history.
+ *
+ * Parking is left alone. The park signal already carries its transcript, and its
+ * unanswered tool call has to stay unanswered for the run to be resumed.
+ */
+function reportFailedTurn(
+  error: unknown,
+  state: LoopState,
+  options: LoopDeps["options"],
+): Effect.Effect<void> {
+  const onFailedTurn = options.onFailedTurn;
+  if (onFailedTurn === undefined || options.internal === true || isRunParkRequested(error)) {
+    return Effect.void;
+  }
+  return Effect.sync(() => {
+    const transcript: Pick<LoopState, "currentMessages"> = {
+      currentMessages: [state.currentMessages[0], ...state.currentMessages.slice(1)],
+    };
+    closeDanglingToolCalls(transcript, FAILED_TURN_TOOL_RESULT);
+    onFailedTurn(transcript.currentMessages);
+  });
 }
 
 /**
@@ -1368,7 +1405,7 @@ export function executeAgentLoop(
             "",
             0,
             deps,
-          );
+          ).pipe(Effect.tapError((error) => reportFailedTurn(error, state, options)));
           if (pendingPhase === "interrupted") {
             finished = true;
             interrupted = true;
@@ -1378,7 +1415,9 @@ export function executeAgentLoop(
         for (let i = 0; i < maxIterations && !interrupted; i++) {
           yield* Effect.sync(() => beginIteration(runMetrics, i + 1));
           try {
-            const step = yield* runIteration(state, i, deps);
+            const step = yield* runIteration(state, i, deps).pipe(
+              Effect.tapError((error) => reportFailedTurn(error, state, options)),
+            );
             if (step.kind === "interrupted") {
               finished = true;
               interrupted = true;
