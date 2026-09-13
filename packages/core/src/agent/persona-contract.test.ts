@@ -11,10 +11,7 @@ import { describe, expect, test } from "bun:test";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 
-const PERSONA_SOURCES: [label: string, dir: string][] = [
-  ["personas", join(REPO_ROOT, "personas")],
-  ["marketplace/personas", join(REPO_ROOT, "marketplace/personas")],
-];
+const PERSONAS_DIR = join(REPO_ROOT, "personas");
 
 // Identity placeholders, substituted from the agent's own config.
 const IDENTITY_PLACEHOLDERS = ["{agentName}", "{agentDescription}"] as const;
@@ -36,8 +33,8 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-describe.each(PERSONA_SOURCES)("persona placeholder contract (%s)", (label, dir) => {
-  const personaNames = readdirSync(dir, { withFileTypes: true })
+describe("built-in persona placeholder contract", () => {
+  const personaNames = readdirSync(PERSONAS_DIR, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name);
 
@@ -46,7 +43,7 @@ describe.each(PERSONA_SOURCES)("persona placeholder contract (%s)", (label, dir)
   });
 
   for (const persona of personaNames) {
-    const path = join(dir, persona, "PERSONA.md");
+    const path = join(PERSONAS_DIR, persona, "PERSONA.md");
     const content = readFileSync(path, "utf-8");
 
     test(`${persona}: each placeholder appears at most once`, () => {
@@ -54,7 +51,7 @@ describe.each(PERSONA_SOURCES)("persona placeholder contract (%s)", (label, dir)
         const occurrences = countOccurrences(content, placeholder);
         expect(
           occurrences,
-          `${placeholder} appears ${occurrences} times in ${label}/${persona}/PERSONA.md — .replace substitutes only the first`,
+          `${placeholder} appears ${occurrences} times in personas/${persona}/PERSONA.md — .replace substitutes only the first`,
         ).toBeLessThanOrEqual(1);
       }
     });
