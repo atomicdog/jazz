@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { FileSystem } from "@effect/platform";
 import { NodeFileSystem } from "@effect/platform-node";
 import type { ProviderName } from "@jazz/core/constants/models";
@@ -17,7 +18,6 @@ import {
 } from "@jazz/core/types/errors";
 import type { AppConfig, LLMConfig, StreamEvent } from "@jazz/core/types/index";
 import { APICallError, generateText } from "ai";
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Cause, Effect, Exit, Layer, Stream } from "effect";
 import { z } from "zod";
@@ -1081,7 +1081,7 @@ describe("buildProviderOptions - llamacpp reasoning", () => {
     const provider = createOpenAICompatible({
       name: "llamacpp",
       baseURL: "http://llm.test/v1",
-      fetch: async (_input, init) => {
+      fetch: (async (_input, init) => {
         requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
         return new Response(
           JSON.stringify({
@@ -1090,13 +1090,15 @@ describe("buildProviderOptions - llamacpp reasoning", () => {
           }),
           { headers: { "content-type": "application/json" } },
         );
-      },
+      }) as typeof fetch,
     });
 
+    const providerOptions = buildProviderOptions("llamacpp", llamacppOptions("low"));
+    if (!providerOptions) throw new Error("expected llamacpp provider options");
     await generateText({
       model: provider("qwen3-8b"),
       prompt: "hi",
-      providerOptions: buildProviderOptions("llamacpp", llamacppOptions("low")),
+      providerOptions,
     });
 
     expect(requestBody?.["chat_template_kwargs"]).toEqual({ enable_thinking: true });
