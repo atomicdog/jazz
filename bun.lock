@@ -33,6 +33,7 @@
         "@effect/sql": "^0.52.1",
         "@effect/workflow": "^0.19.1",
         "@eslint/js": "^10.0.1",
+        "@jazz/adapters": "workspace:*",
         "@modelcontextprotocol/client": "^2.0.0",
         "@openrouter/ai-sdk-provider": "^3.0.0",
         "@opentui/core": "^0.5.11",
@@ -185,6 +186,10 @@
         "@jazz/core": "workspace:*",
         "spectrum-ts": "^12.8.0",
       },
+    },
+    "packages/plugin-sdk": {
+      "name": "@jazz/plugin-sdk",
+      "version": "0.1.0",
     },
     "packages/runtime": {
       "name": "@jazz/runtime",
@@ -540,6 +545,8 @@
     "@jazz/imessage-bot": ["@jazz/imessage-bot@workspace:packages/imessage-bot"],
 
     "@jazz/photon-bot": ["@jazz/photon-bot@workspace:packages/photon-bot"],
+
+    "@jazz/plugin-sdk": ["@jazz/plugin-sdk@workspace:packages/plugin-sdk"],
 
     "@jazz/runtime": ["@jazz/runtime@workspace:packages/runtime"],
 
