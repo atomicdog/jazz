@@ -6,7 +6,7 @@ description: "Configure Jazz runtime limits, context management, output, schedul
 
 Jazz reads global configuration from `~/.jazz/config.json` and optional project overrides from `./.jazz/config.json`.
 
-The merge order is defaults, global configuration, then project configuration. `JAZZ_CONFIG_PATH` or `--config` replaces the global file; it does not disable project overrides. `JAZZ_HOME` or `--data-dir` changes the Jazz data directory.
+The merge order is defaults, global configuration, then project configuration. Objects merge key by key at every depth, so a project `llm.ollama.keep_alive` keeps the global `llm.ollama.base_url`; lists such as `peers` and `webhooks` are replaced whole. `JAZZ_CONFIG_PATH` or `--config` replaces the global file; it does not disable project overrides. `JAZZ_HOME` or `--data-dir` changes the Jazz data directory.
 
 Agents are separate JSON files under the Jazz home directory. MCP server definitions use the shared `.agents/mcp.json` convention. Do not put either into `config.json`.
 
@@ -30,7 +30,33 @@ Configuration files are partial overrides, so include only values you intend to 
 }
 ```
 
-Use `jazz config show`, `jazz config get <key>`, or `jazz config set <key> <value>` instead of editing JSON when practical.
+Use `jazz config show`, `jazz config get <key>`, or `jazz config set <key> <value>` instead of editing JSON when practical. `jazz config validate` checks the global and project files without starting the rest of Jazz, so it remains usable when an invalid file blocks normal startup.
+
+`jazz config set` stores a value with the type the setting is read back as: `jazz config set maxRetries 5` stores the number `5`, and `jazz config set output.collapseReasoning false` stores the boolean `false`. Text settings such as API keys, paths, `logging.level`, and `llm.ollama.keep_alive` are stored as typed. A value that cannot be read as the setting's type is refused instead of written, because a string in a numeric or boolean field is ignored by everything that reads it:
+
+```console
+$ jazz config set maxRetries never
+❌ Configuration Validation Error
+   Field "maxRetries" expected a whole number, got never
+
+💡 Suggestion: Pass a plain whole number, with no units or quotes — 600000, not 600000ms.
+```
+
+It also refuses a key Jazz does not read, suggesting the one a typo most likely meant (`maxRetrys` → `maxRetries`). Lists such as `peers` and `webhooks` are not set one field at a time; use `jazz peers` and `jazz webhook`, or edit the file.
+
+A write changes only the key you set, and only in the global file. Values merged in from a project file, from `--debug`, from environment variables, or from the keyring are never copied into it. Jazz takes a cross-process lock, re-reads the latest file before applying the change, and atomically replaces it, so a concurrent edit is preserved. Unknown or invalid entries remain untouched, but Jazz refuses to overwrite malformed JSON.
+
+## Mistakes in a configuration file
+
+Jazz checks each configuration file before it can affect runtime behavior. A value of the wrong type, an unknown key, or an invalid safety invariant is reported and ignored; valid siblings still load, and Jazz continues with the setting's default. If the JSON itself is malformed, Jazz reports it and uses defaults for that file rather than refusing to start:
+
+```console
+jazz: invalid configuration in /home/you/.jazz/config.json (2 entries):
+  maxRetries: expected a whole number of 0 or more, got "5"
+  maxRetrys: not a setting — did you mean maxRetries?
+```
+
+Run `jazz config validate` for the same diagnostics and a non-zero exit status, without constructing the application layer. A daemon that notices an invalid live edit keeps serving its last-known-good configuration and reports the problem; once the file is repaired, a later reload adopts it. A value found where a secret belongs is described by its type and never printed.
 
 ## Run budgets
 
@@ -60,7 +86,7 @@ Command-line and workflow values override application defaults for that run.
 }
 ```
 
-Both values are fractions of the effective model context window. Jazz requires `warnThresholdRatio < compactThresholdRatio < 0.95`; invalid values are ignored in favor of defaults. See [Long-running work](../features/long-running-work.md).
+Both values are fractions of the effective model context window. Jazz requires `warnThresholdRatio < compactThresholdRatio < 0.95`; invalid values are reported and the defaults apply. See [Long-running work](../features/long-running-work.md).
 
 ## Output and notifications
 

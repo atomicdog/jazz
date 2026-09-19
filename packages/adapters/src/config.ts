@@ -2,6 +2,15 @@
  * Implements `AgentConfigService`: reads/writes `~/.jazz/config.json`, resolving secrets from
  * env vars, the OS keyring, or the file itself (see `secrets/registry`) without ever
  * persisting a secret that came from somewhere other than the file back into it.
+ *
+ * Loading checks the global file and any project `./.jazz/config.json` against
+ * `ConfigFileSchema` before either can affect runtime behavior. Initial loads report and isolate
+ * invalid values so unattended work can continue; live reloads retain the last-known-good
+ * configuration until an edited file is valid again.
+ *
+ * Writing edits the global file as it was read, never the merged runtime view. Nothing from the
+ * defaults, a project override, `--debug`, the environment or the keyring can reach the file
+ * through `set`, and entries Jazz does not understand are left in place rather than deleted.
  */
 
 import { FileSystem } from "@effect/platform";
@@ -16,6 +25,14 @@ import type {
   StorageConfig,
   WebSearchConfig,
 } from "@jazz/core/types/index";
+import {
+  checkConfigWrite,
+  formatConfigIssues,
+  mcpServerEntryName,
+  parseConfigFile,
+  type ConfigFile,
+  validateEffectiveConfig,
+} from "@jazz/core/utils/config-schema";
 import { safeParseJson } from "@jazz/core/utils/json";
 import {
   getGlobalUserDataDirectory,
@@ -26,6 +43,7 @@ import {
   migrateConfigProviderName,
   migrateKeyringProviderName,
 } from "@jazz/core/utils/provider-migration";
+import { withLock, writeFileStringAtomic } from "@jazz/core/utils/storage";
 import { Effect, Layer, Option } from "effect";
 import {
   detectKeyringBackend,
@@ -43,68 +61,41 @@ import { SECRET_PATHS, isSecretPath, secretValueFromEnv } from "./secrets/regist
 const CONFIG_FILE_MODE = 0o600;
 const CONFIG_DIR_MODE = 0o700;
 
-/** Where a resolved secret came from. Anything but "file" must never be persisted. */
-type SecretOrigin = "env" | "keyring";
+/** A config file as parsed from JSON, before any checking: the shape `set` edits and writes back. */
+type ConfigDocument = Record<string, unknown>;
 
-/**
- * Extract only override fields (enabled, trusted) from a server config.
- * Used when persisting to ~/.jazz/config.json — full definitions live in mcp.json.
- */
-function extractMcpOverride(entry: unknown): MCPServerOverride | undefined {
-  if (!entry || typeof entry !== "object") return undefined;
-  const entryData = entry as Record<string, unknown>;
-  const enabled = entryData["enabled"];
-  const trusted = entryData["trusted"];
-  const hasEnabled = typeof enabled === "boolean";
-  const hasTrusted = typeof trusted === "boolean";
-  // Either field alone is a complete override: a server can be trusted without
-  // its enabled state ever having been touched.
-  if (!hasEnabled && !hasTrusted) return undefined;
-  return {
-    ...(hasEnabled ? { enabled } : {}),
-    ...(hasTrusted ? { trusted } : {}),
-  };
+/** Where `storeSecret` put a secret, which decides what the config file keeps of it. */
+type SecretDestination = "keyring" | "file" | "cleared" | "nowhere";
+
+const EMPTY_CONFIG_FILE: ConfigFile = {};
+
+/** The independently owned layers needed to rebuild the effective runtime configuration. */
+interface RuntimeConfigSources {
+  readonly defaults: AppConfig;
+  global: ConfigFile;
+  readonly local: ConfigFile;
+  readonly debug: boolean;
+  readonly agentsServers: Record<string, MCPServerConfig>;
+  readonly resolvedSecrets: Map<string, string>;
 }
 
 /**
- * Build jazz config for persistence: full config but mcpServers replaced by
- * overrides only, and secrets held elsewhere (env or keyring) left out entirely
- * so resolving a key at runtime never causes it to be written back to disk.
- */
-function buildJazzConfigForPersist(
-  config: AppConfig,
-  mcpOverrides: Record<string, MCPServerOverride>,
-  secretOrigins: ReadonlyMap<string, SecretOrigin>,
-  fileSecrets: ReadonlyMap<string, string>,
-): Record<string, unknown> {
-  const json = config as unknown as Record<string, unknown>;
-  const out = structuredClone(json);
-  out["mcpServers"] = Object.keys(mcpOverrides).length > 0 ? mcpOverrides : undefined;
-  for (const path of secretOrigins.keys()) {
-    deepDelete(out, path);
-  }
-  // Restore what the file itself owns, so an env var that merely shadows a
-  // stored key at runtime does not erase it from disk.
-  for (const [path, value] of fileSecrets) {
-    deepSet(out, path, value);
-  }
-  return out;
-}
-
-/**
- * Configuration service using Effect's Config module
+ * Configuration service over the merged runtime view, persisting to the global config file.
  */
 export class AgentConfigServiceImpl implements AgentConfigService {
   private currentConfig: AppConfig;
-  private mcpOverrides: Record<string, MCPServerOverride>;
+  /**
+   * The global config file as it stands on disk, and the only thing `set` writes. Keeping it
+   * apart from `currentConfig` is what stops a write copying merged-in values into the file.
+   */
+  private fileDocument: ConfigDocument;
   private configPath: string | undefined;
   private fs: FileSystem.FileSystem;
   private currentRevision: number;
   /** When config.json was last read, so an external edit can be noticed. */
   private loadedAt: number | undefined;
   private keyringBackend: KeyringBackend;
-  private secretOrigins: Map<string, SecretOrigin>;
-  private fileSecrets: Map<string, string>;
+  private readonly sources: RuntimeConfigSources | undefined;
   /**
    * Secrets that could not be stored anywhere: no keyring, and no structural home in the
    * config file. Tracked so a command can report the failure instead of claiming success.
@@ -113,21 +104,19 @@ export class AgentConfigServiceImpl implements AgentConfigService {
 
   constructor(
     initialConfig: AppConfig,
-    mcpOverrides: Record<string, MCPServerOverride>,
+    fileDocument: ConfigDocument,
     configPath: string | undefined,
     fs: FileSystem.FileSystem,
     keyringBackend: KeyringBackend = "none",
-    secretOrigins: ReadonlyMap<string, SecretOrigin> = new Map(),
-    fileSecrets: ReadonlyMap<string, string> = new Map(),
+    sources?: RuntimeConfigSources,
   ) {
     this.currentConfig = initialConfig;
-    this.mcpOverrides = mcpOverrides;
+    this.fileDocument = fileDocument;
     this.configPath = configPath;
     this.fs = fs;
     this.currentRevision = 0;
     this.keyringBackend = keyringBackend;
-    this.secretOrigins = new Map(secretOrigins);
-    this.fileSecrets = new Map(fileSecrets);
+    this.sources = sources;
   }
 
   get<A>(key: string): Effect.Effect<A, never> {
@@ -153,93 +142,33 @@ export class AgentConfigServiceImpl implements AgentConfigService {
     });
   }
 
-  /**
-   * Handle MCP-related set() keys by updating overrides and in-memory config.
-   * Returns an Effect that resolves to true if the key was handled.
-   */
-  private setMcpOverride(key: string, value: unknown): Effect.Effect<boolean, never> {
-    if (key === "mcpServers") {
-      // Bulk replace overrides (e.g. from remove command)
-      return Effect.gen(
-        function* (this: AgentConfigServiceImpl) {
-          const val = value as Record<string, unknown>;
-          this.mcpOverrides = Object.fromEntries(
-            Object.entries(val ?? {})
-              .map(([k, v]) => [k, extractMcpOverride(v)])
-              .filter((entry): entry is [string, MCPServerOverride] => entry[1] !== undefined),
-          );
-          const agentsServers = yield* loadAgentsMcpServers(this.fs);
-          this.currentConfig = {
-            ...this.currentConfig,
-            mcpServers: mergeMcpServers(agentsServers, this.mcpOverrides),
-          };
-          return true;
-        }.bind(this),
-      );
-    }
-
-    if (!key.startsWith("mcpServers.")) return Effect.succeed(false);
-
-    const rest = key.slice("mcpServers.".length);
-    const dotIndex = rest.indexOf(".");
-    const serverName = dotIndex === -1 ? rest : rest.slice(0, dotIndex);
-    if (!serverName) return Effect.succeed(false);
-
-    if (dotIndex === -1) {
-      // set("mcpServers.X", { enabled: true }) — merge override
-      const val = value as Record<string, unknown>;
-      const next = extractMcpOverride(val) ?? {};
-      this.mcpOverrides[serverName] = { ...this.mcpOverrides[serverName], ...next };
-      const cfg = this.currentConfig.mcpServers?.[serverName] as
-        Record<string, unknown> | undefined;
-      deepSet(this.currentConfig, key, {
-        ...cfg,
-        ...val,
-      });
-    } else {
-      // set("mcpServers.X.enabled", value) / set("mcpServers.X.trusted", value)
-      const prop = rest.slice(dotIndex + 1);
-      if ((prop === "enabled" || prop === "trusted") && typeof value === "boolean") {
-        this.mcpOverrides[serverName] = {
-          ...this.mcpOverrides[serverName],
-          [prop]: value,
-        };
-      }
-      deepSet(this.currentConfig, key, value);
-    }
-    return Effect.succeed(true);
-  }
-
   secretStorageUnavailable(key: string): boolean {
     return this.unstorableSecrets.has(key);
   }
 
   /**
-   * Write one config value, routing secrets away from the structural config.
+   * Write one config value to the runtime view and to the global config file.
    *
-   * A secret whose root names a list has no structural home at all, and clearing one is a
-   * delete rather than an assignment: `undefined` leaves the parent objects behind as an
-   * empty husk once JSON.stringify drops the leaf.
+   * A non-secret value is checked against the config schema first. Every caller hands over an
+   * already-typed value, so one that does not fit is a bug in Jazz rather than bad input, and it
+   * dies instead of being written as a setting nothing will ever read. `jazz config set`, which
+   * does take input, converts and refuses values before they get here.
+   *
+   * Secrets are routed to the keyring when one is usable. A secret whose root names a list has no
+   * structural home at all, and clearing any value is a delete rather than an assignment, so no
+   * empty parent objects are left behind in the file.
    */
   set<A>(key: string, value: A): Effect.Effect<void, never> {
     return Effect.gen(
       function* (this: AgentConfigServiceImpl) {
-        const handled = yield* this.setMcpOverride(key, value);
-        if (!handled) {
-          if (isSecretPath(key) && !structuralHomeFor(this.currentConfig, key)) {
-            yield* Effect.void;
-          } else if (isSecretPath(key) && isBlankSecret(value)) {
-            deepDelete(this.currentConfig as unknown as Record<string, unknown>, key);
-          } else {
-            deepSet(this.currentConfig, key, value);
+        const secret = isSecretPath(key);
+        if (!secret) {
+          const check = checkConfigWrite(key, value);
+          if (!check.ok) {
+            return yield* Effect.die(new Error(`Refusing to write config: ${check.problem}`));
           }
         }
 
-        if (isSecretPath(key)) {
-          yield* this.storeSecret(key, value);
-        }
-
-        // Persist to file
         const path = this.configPath ?? `${getJazzHomeDirectory()}/config.json`;
         if (!this.configPath) {
           this.configPath = path;
@@ -249,51 +178,113 @@ export class AgentConfigServiceImpl implements AgentConfigService {
             .pipe(Effect.catchAll(() => Effect.void));
         }
 
-        const toWrite = buildJazzConfigForPersist(
-          this.currentConfig,
-          this.mcpOverrides,
-          this.secretOrigins,
-          this.fileSecrets,
+        yield* withLock(`${path}.lock`, this.writeValueLocked(path, key, value, secret)).pipe(
+          Effect.provideService(FileSystem.FileSystem, this.fs),
+          Effect.orDie,
         );
-        yield* writePrivateFile(this.fs, path, JSON.stringify(toWrite, null, 2));
-        this.currentRevision += 1;
       }.bind(this),
     ).pipe(Effect.catchAll(() => Effect.void));
   }
 
+  /** Re-read, patch, validate, atomically persist, then commit the new in-memory view. */
+  private writeValueLocked(
+    path: string,
+    key: string,
+    value: unknown,
+    secret: boolean,
+  ): Effect.Effect<void, never> {
+    return Effect.gen(
+      function* (this: AgentConfigServiceImpl) {
+        const latestDocument =
+          this.sources === undefined
+            ? this.fileDocument
+            : yield* readConfigDocumentForWrite(this.fs, path);
+        const nextDocument = structuredClone(latestDocument);
+
+        const nextResolvedSecrets =
+          this.sources === undefined ? undefined : new Map(this.sources.resolvedSecrets);
+
+        if (secret) {
+          const destination = yield* this.storeSecret(key, value);
+          if (destination === "file") deepSet(nextDocument, key, value);
+          else if (destination !== "nowhere") deepDelete(nextDocument, key);
+          if (destination === "file" || destination === "keyring") {
+            nextResolvedSecrets?.set(key, value as string);
+          } else if (destination === "cleared") {
+            nextResolvedSecrets?.delete(key);
+          }
+        } else {
+          writeToDocument(nextDocument, key, value);
+        }
+
+        const checked = parseCheckedConfigFile(path, nextDocument);
+
+        const nextRuntime =
+          this.sources === undefined
+            ? undefined
+            : buildRuntimeConfig({
+                ...this.sources,
+                global: checked.config,
+                resolvedSecrets: nextResolvedSecrets ?? new Map<string, string>(),
+              });
+        const effectiveRuntime =
+          nextRuntime === undefined ? undefined : sanitizeEffectiveConfig(nextRuntime);
+
+        yield* writePrivateFile(this.fs, path, JSON.stringify(nextDocument, null, 2));
+        this.fileDocument = nextDocument;
+        if (this.sources === undefined) {
+          this.applyToRuntime(key, value, secret);
+        } else {
+          this.sources.resolvedSecrets.clear();
+          for (const [secretPath, secretValue] of nextResolvedSecrets ?? []) {
+            this.sources.resolvedSecrets.set(secretPath, secretValue);
+          }
+          this.sources.global = checked.config;
+          this.currentConfig = effectiveRuntime as AppConfig;
+        }
+        this.currentRevision += 1;
+      }.bind(this),
+    );
+  }
+
+  /** Mirror a write into the merged runtime view, so readers see it without a reload. */
+  private applyToRuntime(key: string, value: unknown, secret: boolean): void {
+    const runtime = this.currentConfig as unknown as ConfigDocument;
+    if (secret && !structuralHomeFor(this.currentConfig, key)) return;
+    const mcpName = mcpServerEntryName(key, value);
+    if (mcpName !== undefined) {
+      patchMcpServerEntry(runtime, mcpName, value);
+      return;
+    }
+    if (value === undefined || (secret && isBlankSecret(value))) {
+      deepDelete(runtime, key);
+      return;
+    }
+    deepSet(runtime, key, value);
+  }
+
   /**
-   * Route a secret to the keyring when one is usable, recording where it now
-   * lives so it is excluded from the config file on persist. Falls through to
-   * file storage (mode 0600) when there is no keyring.
+   * Route a secret to the keyring when one is usable, and say where it went so the file keeps
+   * exactly what it should. Falls through to file storage (mode 0600) when there is no keyring.
    *
    * A secret with no structural home cannot use that fallback — JSON.stringify would discard
    * it — so it is left unstored and reported through `secretStorageUnavailable` rather than
    * silently lost.
    */
-  private storeSecret(key: string, value: unknown): Effect.Effect<void, never> {
+  private storeSecret(key: string, value: unknown): Effect.Effect<SecretDestination, never> {
     return Effect.gen(
       function* (this: AgentConfigServiceImpl) {
-        const isBlank = typeof value !== "string" || value.trim() === "";
-        if (isBlank) {
+        if (typeof value !== "string" || value.trim() === "") {
           yield* keyringDelete(this.keyringBackend, key);
-          this.secretOrigins.delete(key);
-          this.fileSecrets.delete(key);
-          return;
+          return "cleared" as const;
         }
 
         const stored = yield* keyringSet(this.keyringBackend, key, value);
-        if (stored) {
-          this.secretOrigins.set(key, "keyring");
-          this.fileSecrets.delete(key);
-          return;
-        }
+        if (stored) return "keyring" as const;
 
-        this.secretOrigins.delete(key);
-        if (structuralHomeFor(this.currentConfig, key)) {
-          this.fileSecrets.set(key, value);
-        } else {
-          this.unstorableSecrets.add(key);
-        }
+        if (structuralHomeFor(this.currentConfig, key)) return "file" as const;
+        this.unstorableSecrets.add(key);
+        return "nowhere" as const;
       }.bind(this),
     );
   }
@@ -310,7 +301,8 @@ export class AgentConfigServiceImpl implements AgentConfigService {
    * Re-read config.json when its mtime has moved, returning whether anything changed.
    *
    * `appConfig` answers from memory, so a caller that must see an edit made by another
-   * process asks for this first. Takes `webhooks` and `peers`; secrets stay in the keyring.
+   * process asks for this first. Takes `webhooks` and `peers`, checked like any load; secrets
+   * stay in the keyring. The file document is replaced too, so a later `set` keeps that edit.
    */
   reloadIfChanged(): Effect.Effect<boolean, never> {
     return Effect.gen(
@@ -331,23 +323,191 @@ export class AgentConfigServiceImpl implements AgentConfigService {
         const content = yield* this.fs
           .readFileString(path)
           .pipe(Effect.catchAll(() => Effect.succeed("")));
-        const parsed = safeParseJson<Partial<AppConfig>>(content);
-        if (Option.isNone(parsed) || typeof parsed.value !== "object" || parsed.value === null) {
+        const document = parseConfigDocument(content);
+        if (document === undefined) {
+          process.stderr.write(
+            `jazz: invalid configuration in ${path}: expected a JSON object.\n` +
+              "jazz: keeping the last-known-good configuration until the file is fixed.\n",
+          );
           return false;
         }
 
-        const fromFile = parsed.value;
-        migrateConfigProviderName(fromFile);
-        this.currentConfig = {
-          ...this.currentConfig,
-          ...(fromFile.webhooks !== undefined ? { webhooks: fromFile.webhooks } : {}),
-          ...(fromFile.peers !== undefined ? { peers: fromFile.peers } : {}),
-        };
+        migrateConfigProviderName(document);
+        const checked = parseCheckedConfigFile(path, document);
+        if (checked.report !== undefined) {
+          process.stderr.write(
+            `${checked.report.trimEnd()}\n` +
+              "jazz: keeping the last-known-good configuration until the file is fixed.\n",
+          );
+          return false;
+        }
+        if (this.sources === undefined) {
+          const fromFile = checked.config;
+          this.currentConfig = {
+            ...this.currentConfig,
+            ...(fromFile.webhooks !== undefined ? { webhooks: fromFile.webhooks } : {}),
+            ...(fromFile.peers !== undefined ? { peers: fromFile.peers } : {}),
+          };
+        } else {
+          const nextRuntime = buildRuntimeConfig({ ...this.sources, global: checked.config });
+          const report = effectiveConfigReport(nextRuntime);
+          if (report !== undefined) {
+            process.stderr.write(
+              `${report.trimEnd()}\n` +
+                "jazz: keeping the last-known-good configuration until the file is fixed.\n",
+            );
+            return false;
+          }
+          this.sources.global = checked.config;
+          this.currentConfig = nextRuntime;
+        }
+        this.fileDocument = document;
         this.currentRevision += 1;
         return true;
       }.bind(this),
     ).pipe(Effect.catchAll(() => Effect.succeed(false)));
   }
+}
+
+function mergedEntry(existing: unknown, patch: unknown): ConfigDocument {
+  return { ...(isPlainObject(existing) ? existing : {}), ...(isPlainObject(patch) ? patch : {}) };
+}
+
+/**
+ * Patch `mcpServers.<name>` at its literal key, merging into that server's existing entry.
+ *
+ * The name is a record key, not a dotted path, so a server named `com.example.mcp` is one key
+ * rather than a nested object — `deepSet` on the dotted form would both misplace it and, before
+ * the schema check reached here, reject it outright.
+ */
+function patchMcpServerEntry(target: ConfigDocument, name: string, patch: unknown): void {
+  const servers = isPlainObject(target["mcpServers"]) ? target["mcpServers"] : {};
+  target["mcpServers"] = { ...servers, [name]: structuredClone(mergedEntry(servers[name], patch)) };
+}
+
+/** Apply a checked, non-secret write to the file document. */
+function writeToDocument(document: ConfigDocument, key: string, value: unknown): void {
+  const mcpName = mcpServerEntryName(key, value);
+  if (mcpName !== undefined) {
+    patchMcpServerEntry(document, mcpName, value);
+    return;
+  }
+  if (value === undefined) {
+    deepDelete(document, key);
+    return;
+  }
+  deepSet(document, key, structuredClone(value));
+}
+
+function isPlainObject(value: unknown): value is ConfigDocument {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Parse a config file's text into a document, or `undefined` when it is not a JSON object. */
+function parseConfigDocument(content: string): ConfigDocument | undefined {
+  const parsed = safeParseJson<unknown>(content);
+  if (Option.isNone(parsed)) return undefined;
+  return isPlainObject(parsed.value) ? parsed.value : undefined;
+}
+
+/**
+ * Re-read the global file immediately before a mutation. This is Pi's useful invariant: a write
+ * patches the latest document, not the snapshot from process startup. Malformed JSON is never
+ * replaced. Schema-invalid entries remain byte-for-byte present unless the requested write targets
+ * them, while the runtime view continues to ignore them.
+ */
+function readConfigDocumentForWrite(
+  fs: FileSystem.FileSystem,
+  path: string,
+): Effect.Effect<ConfigDocument, never> {
+  return Effect.gen(function* () {
+    const exists = yield* fs.exists(path).pipe(Effect.orDie);
+    if (!exists) return {};
+    const content = yield* fs.readFileString(path).pipe(Effect.orDie);
+    const document = parseConfigDocument(content);
+    if (document === undefined) {
+      return yield* Effect.die(
+        new Error(`Refusing to overwrite ${path}: it is not a valid JSON object.`),
+      );
+    }
+    migrateConfigProviderName(document);
+    return document;
+  });
+}
+
+/**
+ * Check one config file against the schema, reporting on stderr what was dropped.
+ *
+ * A legacy `google` block is left to `resolveSecrets`, which removes it with its own notice, so it
+ * is not reported a second time here as an unknown key.
+ */
+function parseCheckedConfigFile(
+  path: string,
+  document: ConfigDocument,
+): { readonly config: ConfigFile; readonly report?: string } {
+  const { google: _legacyGoogle, ...withoutGoogle } = document;
+  const { config, issues } = parseConfigFile(
+    dropLegacyGoogleBlock(document) ? withoutGoogle : document,
+  );
+  const report = formatConfigIssues(path, issues, isSecretPath);
+  return report === undefined ? { config } : { config, report };
+}
+
+/** Validate an initial config load. Invalid files stop startup instead of removing safety limits. */
+function requireValidConfigFile(
+  path: string,
+  document: ConfigDocument,
+): Effect.Effect<ConfigFile, ConfigurationError> {
+  const checked = parseCheckedConfigFile(path, document);
+  if (checked.report === undefined) return Effect.succeed(checked.config);
+  return Effect.fail(
+    new ConfigurationError({
+      field: "file",
+      message: checked.report.trimEnd(),
+      suggestion: `Fix ${path} and restart Jazz.`,
+    }),
+  );
+}
+
+/** Load the largest valid subset and report what was ignored, without blocking startup. */
+function loadCheckedConfigFile(path: string, document: ConfigDocument): ConfigFile {
+  const checked = parseCheckedConfigFile(path, document);
+  if (checked.report !== undefined) process.stderr.write(checked.report);
+  return checked.config;
+}
+
+function effectiveConfigReport(config: AppConfig): string | undefined {
+  return formatConfigIssues(
+    "the merged configuration",
+    validateEffectiveConfig(config),
+    isSecretPath,
+  );
+}
+
+/** Remove invalid cross-layer values from the runtime view after reporting them. */
+function sanitizeEffectiveConfig(config: AppConfig): AppConfig {
+  const issues = validateEffectiveConfig(config);
+  if (issues.length === 0) return config;
+  const report = formatConfigIssues("the merged configuration", issues, isSecretPath);
+  if (report !== undefined) process.stderr.write(report);
+  const sanitized = structuredClone(config) as unknown as ConfigDocument;
+  for (const issue of issues) deepDelete(sanitized, issue.removed);
+  return sanitized as unknown as AppConfig;
+}
+
+function requireValidEffectiveConfig(
+  config: AppConfig,
+): Effect.Effect<AppConfig, ConfigurationError> {
+  const report = effectiveConfigReport(config);
+  return report === undefined
+    ? Effect.succeed(config)
+    : Effect.fail(
+        new ConfigurationError({
+          field: "context",
+          message: report.trimEnd(),
+          suggestion: "Adjust the global or project override so warning precedes compaction.",
+        }),
+      );
 }
 
 function mergeMcpServers(
@@ -378,60 +538,104 @@ export function createConfigLayer(
     AgentConfigServiceTag,
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
-      const loaded = yield* loadConfigFile(fs, customConfigPath);
-      const baseConfig = defaultConfig();
-      const fileConfig = loaded.fileConfig ?? undefined;
+      const files = yield* loadConfigFiles(fs, customConfigPath, "warn");
 
-      // Merge main config (base + file), excluding mcpServers — handled separately
-      const fileConfigWithoutMcp = fileConfig
-        ? (() => {
-            const { mcpServers: _m, ...rest } = fileConfig;
-            return rest as Partial<AppConfig>;
-          })()
-        : undefined;
-      const mainConfig = debug
-        ? mergeConfig(baseConfig, {
-            ...fileConfigWithoutMcp,
-            logging: {
-              ...baseConfig.logging,
-              ...fileConfig?.logging,
-              level: "debug",
-            },
-          })
-        : mergeConfig(baseConfig, fileConfigWithoutMcp);
+      const checkedGlobal =
+        files.global === undefined
+          ? EMPTY_CONFIG_FILE
+          : loadCheckedConfigFile(files.global.path, files.global.document);
+      const checkedLocal =
+        files.local === undefined
+          ? EMPTY_CONFIG_FILE
+          : loadCheckedConfigFile(files.local.path, files.local.document);
+      const { mcpServers: globalOverrides, ...globalSettings } = checkedGlobal;
+      const { mcpServers: localOverrides, ...localSettings } = checkedLocal;
 
-      // Load MCP definitions from .agents/mcp.json
+      const mainConfig = mergeConfigLayers(defaultConfig(), [
+        globalSettings,
+        localSettings,
+        ...(debug ? [{ logging: { level: "debug" } }] : []),
+      ]);
+
       const agentsServers = yield* loadAgentsMcpServers(fs);
-
-      // Extract overrides from global + local jazz config (local wins)
-      const mcpOverrides = {
-        ...extractMcpOverridesFromFile(loaded.globalConfig?.mcpServers),
-        ...extractMcpOverridesFromFile(loaded.localConfig?.mcpServers),
+      const mcpOverrides: Record<string, MCPServerOverride> = {
+        ...globalOverrides,
+        ...localOverrides,
       };
-
       const finalConfig = mergeAgentsMcpIntoConfig(mainConfig, agentsServers, mcpOverrides);
 
       const keyringBackend = yield* detectKeyringBackend();
       const secrets = yield* resolveSecrets(
         fs,
         finalConfig,
-        loaded.configPath,
-        loaded.globalConfig,
+        files.configPath,
+        files.global,
         keyringBackend,
-        loaded.renamedProvider ?? false,
       );
 
+      const persistedGlobal = parseCheckedConfigFile(files.configPath, secrets.document).config;
+      const sources: RuntimeConfigSources = {
+        defaults: baseConfigForRuntime(),
+        global: persistedGlobal,
+        local: checkedLocal,
+        debug: debug === true,
+        agentsServers,
+        resolvedSecrets: snapshotResolvedSecrets(secrets.config),
+      };
+
+      const runtimeConfig = sanitizeEffectiveConfig(buildRuntimeConfig(sources));
+
       return new AgentConfigServiceImpl(
-        secrets.config,
-        mcpOverrides,
-        loaded.configPath,
+        runtimeConfig,
+        secrets.document,
+        files.configPath,
         fs,
         keyringBackend,
-        secrets.origins,
-        secrets.fileSecrets,
+        sources,
       );
     }),
   );
+}
+
+export interface ConfigValidationResult {
+  readonly paths: readonly string[];
+}
+
+/**
+ * Validate configuration without constructing the application layer.
+ *
+ * This is deliberately independent of keyring, provider, telemetry, and agent startup so a
+ * broken file cannot prevent the recovery command that explains how to repair it.
+ */
+export function validateConfigFiles(
+  customConfigPath?: string,
+): Effect.Effect<
+  ConfigValidationResult,
+  ConfigurationError | ConfigurationNotFoundError,
+  FileSystem.FileSystem
+> {
+  return Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const files = yield* loadConfigFiles(fs, customConfigPath);
+    const global =
+      files.global === undefined
+        ? EMPTY_CONFIG_FILE
+        : yield* requireValidConfigFile(files.global.path, files.global.document);
+    const local =
+      files.local === undefined
+        ? EMPTY_CONFIG_FILE
+        : yield* requireValidConfigFile(files.local.path, files.local.document);
+    const { mcpServers: _globalMcp, ...globalSettings } = global;
+    const { mcpServers: _localMcp, ...localSettings } = local;
+    yield* requireValidEffectiveConfig(
+      mergeConfigLayers(defaultConfig(), [globalSettings, localSettings]),
+    );
+    return {
+      paths: [files.global?.path, files.local?.path].filter(
+        (path): path is string => path !== undefined,
+      ),
+    };
+  });
 }
 
 export function getConfigValue<T>(
@@ -470,80 +674,64 @@ function defaultConfig(): AppConfig {
   return { storage, logging, llm, web_search };
 }
 
-function mergeConfig(base: AppConfig, override?: Partial<AppConfig>): AppConfig {
-  if (!override) return base;
-  return {
-    storage: { ...base.storage, ...(override.storage ?? {}) },
-    logging: { ...base.logging, ...(override.logging ?? {}) },
-    ...(override.output && {
-      output: {
-        ...base.output,
-        // Explicitly merge top-level output properties
-        ...(override.output.showReasoning !== undefined
-          ? { showReasoning: override.output.showReasoning }
-          : {}),
-        ...(override.output.showToolExecution !== undefined
-          ? { showToolExecution: override.output.showToolExecution }
-          : {}),
-        ...(override.output.collapseReasoning !== undefined
-          ? { collapseReasoning: override.output.collapseReasoning }
-          : {}),
-        ...(override.output.mode !== undefined ? { mode: override.output.mode } : {}),
-        ...(override.output.colorProfile !== undefined
-          ? { colorProfile: override.output.colorProfile }
-          : {}),
-        ...(override.output.showMetrics !== undefined
-          ? { showMetrics: override.output.showMetrics }
-          : {}),
-        // Merge streaming config
-        ...(override.output.streaming && {
-          streaming: { ...(base.output?.streaming ?? {}), ...override.output.streaming },
-        }),
-      },
-    }),
-    ...(override.llm && { llm: { ...(base.llm ?? {}), ...override.llm } }),
-    ...(override.web_search && {
-      web_search: { ...(base.web_search ?? {}), ...override.web_search },
-    }),
-    ...(override.mcpServers && {
-      mcpServers: { ...(base.mcpServers ?? {}), ...override.mcpServers },
-    }),
-    ...(override.notifications && {
-      notifications: { ...(base.notifications ?? {}), ...override.notifications },
-    }),
-    ...(override.autoApprovedCommands && {
-      autoApprovedCommands: override.autoApprovedCommands,
-    }),
-    // Replaced wholesale rather than merged: peers are a list keyed by name, and a
-    // per-element merge would make removing one from a local override impossible.
-    ...(override.peers && { peers: override.peers }),
-    // Replaced wholesale rather than merged: webhooks are a list keyed by name, and a
-    // per-element merge would make removing one from a local override impossible.
-    ...(override.webhooks && { webhooks: override.webhooks }),
-    ...(override.maxRetries !== undefined && { maxRetries: override.maxRetries }),
-    ...(override.editor !== undefined && { editor: override.editor }),
-    ...(override.maxSubagentDepth !== undefined && {
-      maxSubagentDepth: override.maxSubagentDepth,
-    }),
-    ...(override.maxIterations !== undefined && { maxIterations: override.maxIterations }),
-    ...(override.maxSubagentIterations !== undefined && {
-      maxSubagentIterations: override.maxSubagentIterations,
-    }),
-    ...(override.telemetry && {
-      telemetry: {
-        ...(base.telemetry ?? {}),
-        ...override.telemetry,
-        ...(override.telemetry.otlp && {
-          otlp: { ...(base.telemetry?.otlp ?? {}), ...override.telemetry.otlp },
-        }),
-      },
-    }),
-    // Kept even when the override omits it, so a project-local config.json does not
-    // silently drop globally configured thresholds.
-    ...((base.context ?? override.context) && {
-      context: { ...(base.context ?? {}), ...(override.context ?? {}) },
-    }),
-  };
+/** Named wrapper used when a fresh independent default layer is required. */
+function baseConfigForRuntime(): AppConfig {
+  return defaultConfig();
+}
+
+/**
+ * Lay checked config files over the defaults, later layers winning.
+ *
+ * Objects merge key by key at every depth, so a project file setting `llm.ollama.keep_alive`
+ * keeps the global `llm.ollama.base_url`. Lists and single values replace whole: `peers` and
+ * `webhooks` are keyed by name, and merging them element-wise would make removing one from a
+ * project override impossible.
+ */
+function mergeConfigLayers(base: AppConfig, layers: readonly object[]): AppConfig {
+  let merged = base as unknown as ConfigDocument;
+  for (const layer of layers) {
+    merged = mergeInto(merged, layer);
+  }
+  return merged as unknown as AppConfig;
+}
+
+function mergeInto(base: Readonly<ConfigDocument>, layer: object): ConfigDocument {
+  const out: ConfigDocument = { ...base };
+  for (const [key, value] of Object.entries(layer)) {
+    if (value === undefined) continue;
+    const existing = out[key];
+    out[key] = isPlainObject(value) && isPlainObject(existing) ? mergeInto(existing, value) : value;
+  }
+  return out;
+}
+
+/** Build the effective view without ever making a persisted layer own another layer's values. */
+function buildRuntimeConfig(sources: RuntimeConfigSources): AppConfig {
+  const { mcpServers: globalOverrides, ...globalSettings } = sources.global;
+  const { mcpServers: localOverrides, ...localSettings } = sources.local;
+  const main = mergeConfigLayers(sources.defaults, [
+    globalSettings,
+    localSettings,
+    ...(sources.debug ? [{ logging: { level: "debug" } }] : []),
+  ]);
+  const withMcp = mergeAgentsMcpIntoConfig(main, sources.agentsServers, {
+    ...globalOverrides,
+    ...localOverrides,
+  });
+  const runtime = structuredClone(withMcp) as unknown as ConfigDocument;
+  for (const [path, value] of sources.resolvedSecrets) deepSet(runtime, path, value);
+  return runtime as unknown as AppConfig;
+}
+
+/** Capture the already-resolved secret overlay so rebuilding sources never drops credentials. */
+function snapshotResolvedSecrets(config: AppConfig): Map<string, string> {
+  const values = new Map<string, string>();
+  const paths = new Set([...SECRET_PATHS, ...collectSecretPaths(config)]);
+  for (const path of paths) {
+    const value = deepGet(config, path);
+    if (nonEmptyString(value)) values.set(path, value);
+  }
+  return values;
 }
 
 /**
@@ -556,9 +744,10 @@ function writePrivateFile(
   content: string,
 ): Effect.Effect<void, never> {
   return Effect.gen(function* () {
-    yield* fs
-      .writeFileString(filePath, content, { mode: CONFIG_FILE_MODE })
-      .pipe(Effect.catchAll(() => Effect.void));
+    yield* writeFileStringAtomic(fs, filePath, content, {
+      tempPrefix: "jazz-config",
+      mode: CONFIG_FILE_MODE,
+    }).pipe(Effect.orDie);
     yield* chmodQuietly(fs, filePath, CONFIG_FILE_MODE);
   });
 }
@@ -615,39 +804,34 @@ function nonEmptyString(value: unknown): value is string {
  * Resolve secrets in precedence order — environment, then keyring, then the
  * config file — and move any plaintext left in the global config file into the
  * keyring when one is available.
+ *
+ * Returns the global file as it now stands on disk, which is what later writes edit. A secret
+ * resolved from the environment or the keyring only ever lands in the runtime view.
  */
 function resolveSecrets(
   fs: FileSystem.FileSystem,
   config: AppConfig,
-  globalConfigPath: string | undefined,
-  globalFileConfig: Partial<AppConfig> | undefined,
+  globalConfigPath: string,
+  globalFile: GlobalConfigFileOnDisk | undefined,
   backend: KeyringBackend,
-  renamedProvider: boolean,
-): Effect.Effect<
-  {
-    config: AppConfig;
-    origins: Map<string, SecretOrigin>;
-    fileSecrets: Map<string, string>;
-  },
-  never
-> {
+): Effect.Effect<{ config: AppConfig; document: ConfigDocument }, never> {
   return Effect.gen(function* () {
     yield* migrateKeyringProviderName(backend, keyringGet, keyringSet, keyringDelete);
 
-    const resolved = structuredClone(config) as unknown as Record<string, unknown>;
-    const origins = new Map<string, SecretOrigin>();
+    const resolved = structuredClone(config) as unknown as ConfigDocument;
+    const fromEnv = new Set<string>();
     const candidates = new Set([...SECRET_PATHS, ...collectSecretPaths(config)]);
 
     for (const path of candidates) {
       const envValue = secretValueFromEnv(path);
       if (nonEmptyString(envValue)) {
         deepSet(resolved, path, envValue);
-        origins.set(path, "env");
+        fromEnv.add(path);
       }
     }
 
     if (backend !== "none") {
-      const lookups = [...candidates].filter((path) => !origins.has(path));
+      const lookups = [...candidates].filter((path) => !fromEnv.has(path));
       const found = yield* Effect.all(
         lookups.map((path) =>
           keyringGet(backend, path).pipe(Effect.map((value) => [path, value] as const)),
@@ -657,40 +841,29 @@ function resolveSecrets(
       for (const [path, value] of found) {
         if (!nonEmptyString(value)) continue;
         deepSet(resolved, path, value);
-        origins.set(path, "keyring");
       }
     }
 
-    const fileRecord = (globalFileConfig ?? {}) as unknown as Record<string, unknown>;
-    const migrated = yield* migratePlaintextSecrets(backend, fileRecord, candidates);
-    for (const path of migrated) {
-      origins.set(path, "keyring");
-    }
+    const document = globalFile?.document ?? {};
+    const migrated = yield* migratePlaintextSecrets(backend, document, candidates);
+    const droppedLegacy = dropLegacyGoogleBlock(document);
 
-    // Secrets the file still legitimately owns. Kept verbatim so that a shadowing
-    // env var never causes the stored copy to be dropped on the next write.
-    const fileSecrets = new Map<string, string>();
-    for (const path of candidates) {
-      if (migrated.includes(path)) continue;
-      const fileValue = deepGet(fileRecord, path);
-      if (nonEmptyString(fileValue)) fileSecrets.set(path, fileValue);
-    }
-
-    const droppedLegacy = dropLegacyGoogleBlock(fileRecord);
-
-    if ((migrated.length > 0 || droppedLegacy || renamedProvider) && globalConfigPath) {
-      const cleaned = structuredClone(fileRecord);
+    if (
+      globalFile !== undefined &&
+      (migrated.length > 0 || droppedLegacy || globalFile.renamedProvider)
+    ) {
+      const cleaned = structuredClone(document);
       for (const path of migrated) {
         deepDelete(cleaned, path);
       }
       if (droppedLegacy) delete cleaned["google"];
       yield* writePrivateFile(fs, globalConfigPath, JSON.stringify(cleaned, null, 2));
       if (droppedLegacy) noticeLegacyGoogleRemoved(globalConfigPath);
-    } else if (globalConfigPath) {
-      yield* chmodQuietly(fs, globalConfigPath, CONFIG_FILE_MODE);
+      return { config: resolved as unknown as AppConfig, document: cleaned };
     }
 
-    return { config: resolved as unknown as AppConfig, origins, fileSecrets };
+    yield* chmodQuietly(fs, globalConfigPath, CONFIG_FILE_MODE);
+    return { config: resolved as unknown as AppConfig, document };
   });
 }
 
@@ -756,48 +929,108 @@ function expandHome(p: string): string {
   return p;
 }
 
-function stripStorageOverride(config: Partial<AppConfig>): Partial<AppConfig> {
-  const { storage: _storage, ...rest } = config;
-  return rest;
+/** One config file as read from disk. */
+interface ConfigFileOnDisk {
+  readonly path: string;
+  readonly document: ConfigDocument;
 }
 
+interface GlobalConfigFileOnDisk extends ConfigFileOnDisk {
+  /** Whether the provider-name migration rewrote the document, so the file needs saving. */
+  readonly renamedProvider: boolean;
+}
+
+interface ConfigFilesOnDisk {
+  /** Where writes go, whether or not a file exists there yet. */
+  readonly configPath: string;
+  readonly global?: GlobalConfigFileOnDisk;
+  /** The project file, with `storage` already removed: agents always live in the Jazz home. */
+  readonly local?: ConfigFileOnDisk;
+}
+
+type InvalidConfigPolicy = "warn" | "fail";
+
+function handleInvalidConfig(
+  error: ConfigurationError,
+  policy: InvalidConfigPolicy,
+): Effect.Effect<undefined, ConfigurationError> {
+  if (policy === "fail") return Effect.fail(error);
+  process.stderr.write(`jazz: ${error.message}\n`);
+  return Effect.succeed(undefined);
+}
+
+/**
+ * Read a config file that may legitimately be absent. A file that exists but is not a JSON object
+ * is reported and treated as absent, rather than silently ignored.
+ */
 function readOptionalConfigFile(
   fs: FileSystem.FileSystem,
   filePath: string,
-): Effect.Effect<{ config: Partial<AppConfig>; renamedProvider: boolean } | undefined, never> {
+  policy: InvalidConfigPolicy,
+): Effect.Effect<GlobalConfigFileOnDisk | undefined, ConfigurationError> {
   return Effect.gen(function* () {
     const exists = yield* fs.exists(filePath).pipe(Effect.catchAll(() => Effect.succeed(false)));
     if (!exists) return undefined;
 
-    const content = yield* fs
-      .readFileString(filePath)
-      .pipe(Effect.catchAll(() => Effect.succeed("")));
-    if (!content.trim()) return undefined;
+    const content = yield* fs.readFileString(filePath).pipe(
+      Effect.catchAll((cause) =>
+        handleInvalidConfig(
+          new ConfigurationError({
+            field: "file",
+            message: `Cannot read config file at ${filePath}: ${String(cause)}`,
+            suggestion: "Check the file permissions and try again.",
+          }),
+          policy,
+        ),
+      ),
+    );
+    if (content === undefined) return undefined;
+    if (!content.trim()) {
+      return yield* handleInvalidConfig(
+        new ConfigurationError({
+          field: "file",
+          message: `Config file is empty: ${filePath}`,
+          suggestion: "Delete the empty file or replace it with a JSON object.",
+        }),
+        policy,
+      );
+    }
 
-    const parsed = safeParseJson<Partial<AppConfig>>(content);
-    if (Option.isNone(parsed)) return undefined;
+    const document = parseConfigDocument(content);
+    if (document === undefined) {
+      return yield* handleInvalidConfig(
+        new ConfigurationError({
+          field: "format",
+          message: `Config file is not a valid JSON object: ${filePath}`,
+          suggestion: "Fix the JSON before starting Jazz.",
+        }),
+        policy,
+      );
+    }
 
-    const config = parsed.value;
-    if (typeof config !== "object" || config === null) return undefined;
-
-    const renamedProvider = migrateConfigProviderName(config);
-    return { config, renamedProvider };
+    const renamedProvider = migrateConfigProviderName(document);
+    return { path: filePath, document, renamedProvider };
   });
 }
 
-function loadConfigFile(
+function readLocalConfigFile(
+  fs: FileSystem.FileSystem,
+  policy: InvalidConfigPolicy,
+): Effect.Effect<ConfigFileOnDisk | undefined, ConfigurationError> {
+  return readOptionalConfigFile(fs, `${getLocalJazzDirectory()}/config.json`, policy).pipe(
+    Effect.map((file) => {
+      if (file === undefined) return undefined;
+      const { storage: _storage, ...document } = file.document;
+      return { path: file.path, document };
+    }),
+  );
+}
+
+function loadConfigFiles(
   fs: FileSystem.FileSystem,
   customConfigPath?: string,
-): Effect.Effect<
-  {
-    configPath?: string;
-    fileConfig?: Partial<AppConfig>;
-    globalConfig?: Partial<AppConfig>;
-    localConfig?: Partial<AppConfig>;
-    renamedProvider?: boolean;
-  },
-  ConfigurationError | ConfigurationNotFoundError
-> {
+  policy: InvalidConfigPolicy = "fail",
+): Effect.Effect<ConfigFilesOnDisk, ConfigurationError | ConfigurationNotFoundError> {
   return Effect.gen(function* () {
     // If custom config path is provided, validate and use it exclusively
     if (customConfigPath) {
@@ -815,124 +1048,27 @@ function loadConfigFile(
         );
       }
 
-      const contentResult = yield* fs.readFileString(expandedPath).pipe(
-        Effect.catchAll((error) =>
-          Effect.fail(
-            new ConfigurationError({
-              field: "file",
-              message: `Cannot read config file at: ${expandedPath}. Reason: ${String(error)}`,
-              suggestion: "Check file permissions and ensure the file is readable.",
-            }),
-          ),
-        ),
-      );
-
-      const content = contentResult;
-
-      if (!content) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            field: "file",
-            message: `Config file is empty: ${expandedPath}`,
-            suggestion: "Add valid JSON configuration to the file.",
-          }),
-        );
-      }
-
-      const parsed = safeParseJson<Partial<AppConfig>>(content);
-      if (Option.isNone(parsed)) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            field: "format",
-            message: `Invalid JSON in config file: ${expandedPath}`,
-            suggestion: "Please ensure the file contains valid JSON.",
-          }),
-        );
-      }
-
-      const config = parsed.value;
-      if (typeof config !== "object" || config === null) {
-        return yield* Effect.fail(
-          new ConfigurationError({
-            field: "structure",
-            message: `Config file must contain a valid configuration object: ${expandedPath}`,
-            value: config,
-            suggestion: 'Expected format: { "llm": {...}, "storage": {...}, ... }',
-          }),
-        );
-      }
-
-      const renamedProvider = migrateConfigProviderName(config);
-
-      const localConfigPath = `${getLocalJazzDirectory()}/config.json`;
-      const localRead = yield* readOptionalConfigFile(fs, localConfigPath);
-      const localConfigRaw = localRead?.config;
-      const localConfig = localConfigRaw ? stripStorageOverride(localConfigRaw) : undefined;
-
-      const emptyBase = defaultConfig();
-      const mergedFromGlobal = mergeConfig(emptyBase, config);
-      const merged = localConfig ? mergeConfig(mergedFromGlobal, localConfig) : mergedFromGlobal;
-
-      const result: {
-        configPath: string;
-        fileConfig: Partial<AppConfig>;
-        globalConfig?: Partial<AppConfig>;
-        localConfig?: Partial<AppConfig>;
-        renamedProvider?: boolean;
-      } = {
+      const global = yield* readOptionalConfigFile(fs, expandedPath, policy);
+      const local = yield* readLocalConfigFile(fs, policy);
+      return {
         configPath: expandedPath,
-        fileConfig: merged,
-        globalConfig: config,
-        renamedProvider,
+        ...(global !== undefined ? { global } : {}),
+        ...(local !== undefined ? { local } : {}),
       };
-
-      if (localConfigRaw) {
-        result.localConfig = localConfigRaw;
-      }
-
-      return result;
     }
 
     const envConfigPath = process.env["JAZZ_CONFIG_PATH"];
     const globalConfigPath = envConfigPath
       ? expandHome(envConfigPath)
       : `${getJazzHomeDirectory()}/config.json`;
-    const localConfigPath = `${getLocalJazzDirectory()}/config.json`;
 
-    const globalRead = yield* readOptionalConfigFile(fs, globalConfigPath);
-    const globalConfig = globalRead?.config;
-    const localRead = yield* readOptionalConfigFile(fs, localConfigPath);
-    const localConfigRaw = localRead?.config;
-    const localConfig = localConfigRaw ? stripStorageOverride(localConfigRaw) : undefined;
-
-    if (!globalConfig && !localConfig) {
-      return { configPath: globalConfigPath };
-    }
-
-    const emptyBase = defaultConfig();
-    const mergedFromGlobal = globalConfig ? mergeConfig(emptyBase, globalConfig) : emptyBase;
-    const merged = localConfig ? mergeConfig(mergedFromGlobal, localConfig) : mergedFromGlobal;
-
-    const result: {
-      configPath: string;
-      fileConfig: Partial<AppConfig>;
-      globalConfig?: Partial<AppConfig>;
-      localConfig?: Partial<AppConfig>;
-      renamedProvider?: boolean;
-    } = {
+    const global = yield* readOptionalConfigFile(fs, globalConfigPath, policy);
+    const local = yield* readLocalConfigFile(fs, policy);
+    return {
       configPath: globalConfigPath,
-      fileConfig: merged,
-      renamedProvider: globalRead?.renamedProvider ?? false,
+      ...(global !== undefined ? { global } : {}),
+      ...(local !== undefined ? { local } : {}),
     };
-
-    if (globalConfig) {
-      result.globalConfig = globalConfig;
-    }
-    if (localConfigRaw) {
-      result.localConfig = localConfigRaw;
-    }
-
-    return result;
   });
 }
 
@@ -988,18 +1124,6 @@ function loadAgentsMcpServers(
 
     return merged as Record<string, MCPServerConfig>;
   });
-}
-
-function extractMcpOverridesFromFile(
-  mcpServers: Record<string, unknown> | undefined,
-): Record<string, MCPServerOverride> {
-  if (!mcpServers || typeof mcpServers !== "object") return {};
-  const out: Record<string, MCPServerOverride> = {};
-  for (const [name, entry] of Object.entries(mcpServers)) {
-    const ov = extractMcpOverride(entry);
-    if (ov) out[name] = ov;
-  }
-  return out;
 }
 
 /**
@@ -1129,17 +1253,6 @@ function deepGet(obj: object, path: string): unknown {
   return cur;
 }
 
-/**
- * Sets a value at the given dot notation path, creating intermediate objects as needed.
- *
- * Example: deepSet(obj, "storage.type", "file") sets obj.storage.type = "file"
- * If obj.storage doesn't exist, it will be created as an empty object first.
- */
-/**
- * Removes the value at a dot notation path, then discards any parent objects
- * the removal emptied — so dropping `llm.openai.api_key` does not leave an
- * orphaned `llm.openai: {}` behind in the written config.
- */
 /** A secret being cleared, matching what `storeSecret` treats as blank. */
 function isBlankSecret(value: unknown): boolean {
   return typeof value !== "string" || value.trim() === "";
@@ -1158,6 +1271,11 @@ function structuralHomeFor(config: AppConfig, path: string): boolean {
   return !Array.isArray((config as unknown as Record<string, unknown>)[root]);
 }
 
+/**
+ * Removes the value at a dot notation path, then discards any parent objects
+ * the removal emptied — so dropping `llm.openai.api_key` does not leave an
+ * orphaned `llm.openai: {}` behind in the written config.
+ */
 function deepDelete(obj: Record<string, unknown>, path: string): void {
   const parts = path.split(".").filter(Boolean);
   if (parts.length === 0) return;
@@ -1180,9 +1298,8 @@ function deepDelete(obj: Record<string, unknown>, path: string): void {
   }
 }
 
-/** Sets a value at a dotted path on any object. */
 /**
- * Write a dotted path, refusing to descend into a list.
+ * Write a dotted path, creating intermediate objects as needed but refusing to descend into a list.
  *
  * `typeof [] === "object"`, so walking into an array attaches a named property to it — and
  * `JSON.stringify` drops named properties on arrays, so the value is written, reported as
