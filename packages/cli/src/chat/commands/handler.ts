@@ -977,10 +977,7 @@ function handleCompactCommand(
     }
 
     // The same window a run compacts against, so the recent messages kept verbatim are
-    // the same share of it. llama.cpp honours the window it was started with, not the
-    // advertised maximum, so resolve the served window here exactly as a run does —
-    // otherwise `/compact` sizes "recent" against the 128k fallback and, on a small
-    // server, decides the whole conversation is recent and does nothing.
+    // the same share of it.
     const provider = agent.config.llmProvider;
     const advertisedContextWindow = yield* getModelContextWindowEffect(
       agent.config.llmModel,
