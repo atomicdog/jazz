@@ -209,10 +209,9 @@ export interface AgentRunnerOptions {
    */
   readonly onDetachedToolComplete?: (summary: string) => void;
   /**
-   * Callback invoked with this turn's transcript when the run fails — an LLM request that
-   * timed out, say — so the caller can keep the work instead of reverting to the history
-   * it passed in. Tool calls that never got a result are closed in the copy. Not called
-   * for internal (sub-agent) runs, nor for a run that parks.
+   * Called with this turn's transcript when the run fails, so the caller can keep the work
+   * instead of reverting to the history it passed in. Dangling tool calls are closed. Not
+   * called for internal (sub-agent) runs or a run that parks.
    */
   readonly onFailedTurn?: (messages: ConversationMessages) => void;
   /**

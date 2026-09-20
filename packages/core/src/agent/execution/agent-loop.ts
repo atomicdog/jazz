@@ -515,10 +515,9 @@ function finalizeRun(
 }
 
 /**
- * Close out assistant `tool_calls` that never got a `role: "tool"` result so the
- * transcript stays valid for the next LLM request. Used when the user interrupts
- * mid-batch (executeToolCalls fails before handleToolPhase can append results), and
- * on a copy of the transcript when a turn fails outright.
+ * Close assistant `tool_calls` that never got a `role: "tool"` result, so the transcript
+ * stays valid to send. Used on a user interrupt mid-batch, and on a copy of the transcript
+ * when a turn fails outright.
  */
 function closeDanglingToolCalls(
   state: Pick<LoopState, "currentMessages">,
@@ -551,15 +550,12 @@ const FAILED_TURN_TOOL_RESULT =
   "Tool execution did not finish: the run failed before this tool returned a result.";
 
 /**
- * Hand a failed turn's transcript to the caller before the failure unwinds it.
+ * Hand a failed turn's transcript to the caller before the failure unwinds it — otherwise
+ * the caller reverts to the history it passed in and the turn's work is lost. Dangling tool
+ * calls are closed on the copy so it stays valid to send.
  *
- * The caller otherwise holds only the history it passed in, so one failed LLM request
- * erased the whole turn: the user's message and every tool call and result, however many
- * iterations deep. The next "continue" then reached a model with no idea what it had been
- * doing. The copy has its dangling tool calls closed, so it is valid to send as history.
- *
- * Parking is left alone. The park signal already carries its transcript, and its
- * unanswered tool call has to stay unanswered for the run to be resumed.
+ * Parking is skipped: its transcript rides the signal, and its unanswered tool call must
+ * stay unanswered to resume.
  */
 function reportFailedTurn(
   error: unknown,

@@ -471,9 +471,8 @@ export class ChatServiceImpl implements ChatService {
           // Use a getter for autoApprovePolicy to support real-time mode switches via Shift+Tab
           const getCurrentAutoApprovePolicy = () => autoApprovePolicy;
 
-          // Set only when this turn fails: what it had done by then. Without it a failed LLM
-          // request reverts to the history from before the turn, and "continue" reaches a
-          // model that has no idea what it was working on.
+          // Set only when the turn fails: its work so far, so "continue" doesn't revert to
+          // the pre-turn history.
           let failedTurnMessages: ChatMessage[] | undefined;
 
           const runnerOptions: AgentRunnerOptions = {
@@ -604,8 +603,7 @@ export class ChatServiceImpl implements ChatService {
                 }
                 yield* terminal.log("");
 
-                // Return a minimal response to allow the loop to continue. A failed turn hands
-                // back what it had done by then, so that work stays in the history.
+                // Minimal response so the loop continues; a failed turn hands back its work.
                 return {
                   conversationId: conversationId || "",
                   messages: failedTurnMessages ?? conversationHistory,
@@ -676,8 +674,7 @@ export class ChatServiceImpl implements ChatService {
             loggedMessageCount += 1;
           }
 
-          // A failed turn that handed back its work is saved like any other, so the work
-          // survives a restart as well as the next message.
+          // A failed turn that kept its work is saved too, so it survives a restart.
           if (!lastTurnErrored || failedTurnMessages !== undefined) {
             yield* persistConversationIfNeeded({
               ephemeral,
