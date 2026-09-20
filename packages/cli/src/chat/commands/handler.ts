@@ -4,7 +4,7 @@ import { FileSystem } from "@effect/platform";
 import { loadConversation, loadHistory } from "@jazz/adapters/history/conversation-history-service";
 import { getLogsDirectory } from "@jazz/adapters/logger";
 import { authorizeServer, clearServerAuth, hasStoredAuth } from "@jazz/adapters/mcp/oauth";
-import { AgentRunner } from "@jazz/core/agent/agent-runner";
+import { AgentRunner, resolveLlamaCppServerModel } from "@jazz/core/agent/agent-runner";
 import { getAgentByIdentifier } from "@jazz/core/agent/agent-service";
 import { sortAgents } from "@jazz/core/agent/agent-sort";
 import { resolveContextThresholds } from "@jazz/core/agent/context/context-thresholds";
@@ -983,12 +983,15 @@ function handleCompactCommand(
       agent.config.llmModel,
       provider,
     );
+    const servedContextWindow =
+      provider === "llamacpp" ? (yield* resolveLlamaCppServerModel()).contextWindow : undefined;
     const contextWindow = resolveEffectiveContextWindow({
       provider,
       ...(advertisedContextWindow !== undefined && { modelMaxTokens: advertisedContextWindow }),
       ...(typeof agent.config.numCtx === "number" && {
         pinnedContextWindow: agent.config.numCtx,
       }),
+      ...(typeof servedContextWindow === "number" && { serverContextWindow: servedContextWindow }),
       ...(typeof agent.config.maxContextTokens === "number" && {
         agentMaxTokens: agent.config.maxContextTokens,
       }),

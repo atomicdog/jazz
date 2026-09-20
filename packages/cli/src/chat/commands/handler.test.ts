@@ -426,6 +426,52 @@ describe("handleSpecialCommand /compact", () => {
       spy.mockRestore();
     }
   });
+
+  test("accounts against the llama.cpp served window, not the advertised fallback", async () => {
+    const llamaAgent: Agent = {
+      ...testAgent,
+      config: { ...testAgent.config, llmProvider: "llamacpp", llmModel: "local-model" },
+    };
+    const llamaContext: CommandContext = { ...context, agent: llamaAgent };
+
+    let receivedContextWindow: number | undefined;
+    const spy = spyOn(AgentRunner, "compactHistory").mockImplementation(
+      (_messages, _agent, _conversationId, contextWindowTokens) => {
+        receivedContextWindow = contextWindowTokens;
+        return Effect.succeed(undefined) as unknown as ReturnType<
+          typeof AgentRunner.compactHistory
+        >;
+      },
+    );
+
+    const mockLLMService: Partial<LLMService> = {
+      resolveLocalProviderBaseUrl: () => "http://localhost:8080",
+      fetchLlamaCppServerModel: () => Effect.succeed({ contextWindow: 8000 }),
+    };
+    const mockTerminal: Partial<TerminalService> = {
+      info: mock(() => Effect.void),
+      success: mock(() => Effect.void),
+      warn: mock(() => Effect.void),
+      error: mock(() => Effect.void),
+      log: mock(() => Effect.succeed(undefined)),
+    };
+    const layers = Layer.mergeAll(
+      Layer.succeed(TerminalServiceTag, mockTerminal as unknown as TerminalService),
+      Layer.succeed(LLMServiceTag, mockLLMService as unknown as LLMService),
+    );
+
+    try {
+      await Effect.runPromise(
+        handleSpecialCommand({ type: "compact", args: [] }, llamaContext).pipe(
+          Effect.provide(layers),
+        ) as Effect.Effect<CommandResult, unknown, never>,
+      );
+
+      expect(receivedContextWindow).toBe(8000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe("handleSpecialCommand /tools", () => {

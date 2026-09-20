@@ -149,7 +149,11 @@ function resolveSupportedAttachmentKinds(
  * missing) resolves to an empty result and the caller keeps the stored values — this must never
  * fail the run.
  */
-function resolveLlamaCppServerModel(): Effect.Effect<LlamaCppServerModel, never, LLMService> {
+export function resolveLlamaCppServerModel(): Effect.Effect<
+  LlamaCppServerModel,
+  never,
+  LLMService
+> {
   return Effect.gen(function* () {
     const llmService = yield* LLMServiceTag;
     const baseUrl = llmService.resolveLocalProviderBaseUrl("llamacpp", undefined);
