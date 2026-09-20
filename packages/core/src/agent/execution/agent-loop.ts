@@ -588,6 +588,19 @@ function reportFailedTurn(
  * A user interrupt during tools returns `"interrupted"` instead of failing the
  * run — the same clean stop as interrupting the LLM stream.
  */
+/**
+ * Whether this run may write durable memory when its history is compacted.
+ *
+ * Sub-agent runs (`internal`) have no human user for the user-stated bar, and
+ * `disablePersistence` (--ephemeral, A2A peers) means write nothing. The recursive
+ * runner does not carry either into a sub-run, so the answer is computed here, where
+ * the run's own options are known, and passed to every compaction path: automatic
+ * compaction below, and the `summarize_context` tool through its context.
+ */
+function mayExtractMemories(options: AgentRunnerOptions): boolean {
+  return !options.internal && options.disablePersistence !== true;
+}
+
 function handleToolPhase(
   state: LoopState,
   toolCalls: NonNullable<ChatCompletionResponse["toolCalls"]>,
@@ -667,6 +680,7 @@ function handleToolPhase(
           ...compacted.slice(1),
         ] as typeof state.currentMessages;
       },
+      allowMemoryExtraction: mayExtractMemories(options),
       recordChildCost: (costUSD: number) => {
         runMetrics.childCostUSD += costUSD;
       },
@@ -966,11 +980,7 @@ function runIteration(
       }
     }
 
-    // Only the top-level, persistence-enabled run may write memory at compaction.
-    // Sub-agent runs (`internal`) have no human user for the user-stated bar, and
-    // `disablePersistence` (--ephemeral, A2A peers) means write nothing — a gate the
-    // recursive runner does not inherit on its own, so it is enforced here.
-    const allowMemoryExtraction = !options.internal && options.disablePersistence !== true;
+    const allowMemoryExtraction = mayExtractMemories(options);
     const messagesBeforeCompact = state.currentMessages;
     state.currentMessages = yield* Summarizer.compactIfNeeded(
       state.currentMessages,
@@ -1058,7 +1068,7 @@ function runIteration(
     const messagesForLLM = pressureContent
       ? ([
           ...state.currentMessages,
-          { role: "user" as const, content: pressureContent },
+          { role: "user" as const, content: pressureContent, kind: "ephemeral" as const },
         ] as typeof state.currentMessages)
       : state.currentMessages;
 
