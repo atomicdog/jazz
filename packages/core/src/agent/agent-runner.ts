@@ -148,8 +148,15 @@ function resolveSupportedAttachmentKinds(
  * live model and context window from the server instead. Any failure (server down, endpoint
  * missing) resolves to an empty result and the caller keeps the stored values — this must never
  * fail the run.
+ *
+ * Exported so out-of-run compaction (`/compact` in chat) can account against the same served
+ * window a run would, rather than the advertised maximum llama.cpp does not honour.
  */
-function resolveLlamaCppServerModel(): Effect.Effect<LlamaCppServerModel, never, LLMService> {
+export function resolveLlamaCppServerModel(): Effect.Effect<
+  LlamaCppServerModel,
+  never,
+  LLMService
+> {
   return Effect.gen(function* () {
     const llmService = yield* LLMServiceTag;
     const baseUrl = llmService.resolveLocalProviderBaseUrl("llamacpp", undefined);

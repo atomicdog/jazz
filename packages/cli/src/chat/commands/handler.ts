@@ -4,7 +4,7 @@ import { FileSystem } from "@effect/platform";
 import { loadConversation, loadHistory } from "@jazz/adapters/history/conversation-history-service";
 import { getLogsDirectory } from "@jazz/adapters/logger";
 import { authorizeServer, clearServerAuth, hasStoredAuth } from "@jazz/adapters/mcp/oauth";
-import { AgentRunner } from "@jazz/core/agent/agent-runner";
+import { AgentRunner, resolveLlamaCppServerModel } from "@jazz/core/agent/agent-runner";
 import { getAgentByIdentifier } from "@jazz/core/agent/agent-service";
 import { sortAgents } from "@jazz/core/agent/agent-sort";
 import { resolveContextThresholds } from "@jazz/core/agent/context/context-thresholds";
@@ -977,18 +977,24 @@ function handleCompactCommand(
     }
 
     // The same window a run compacts against, so the recent messages kept verbatim are
-    // the same share of it.
+    // the same share of it. llama.cpp honours the window it was started with, not the
+    // advertised maximum, so resolve the served window here exactly as a run does —
+    // otherwise `/compact` sizes "recent" against the 128k fallback and, on a small
+    // server, decides the whole conversation is recent and does nothing.
     const provider = agent.config.llmProvider;
     const advertisedContextWindow = yield* getModelContextWindowEffect(
       agent.config.llmModel,
       provider,
     );
+    const servedContextWindow =
+      provider === "llamacpp" ? (yield* resolveLlamaCppServerModel()).contextWindow : undefined;
     const contextWindow = resolveEffectiveContextWindow({
       provider,
       ...(advertisedContextWindow !== undefined && { modelMaxTokens: advertisedContextWindow }),
       ...(typeof agent.config.numCtx === "number" && {
         pinnedContextWindow: agent.config.numCtx,
       }),
+      ...(typeof servedContextWindow === "number" && { serverContextWindow: servedContextWindow }),
       ...(typeof agent.config.maxContextTokens === "number" && {
         agentMaxTokens: agent.config.maxContextTokens,
       }),
