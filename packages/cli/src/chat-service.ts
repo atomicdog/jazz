@@ -61,7 +61,7 @@ import {
   findExceededSessionLimits,
 } from "./chat/commands/session-limits";
 import type { CommandContext, CommandResult, SessionLimits } from "./chat/commands/types";
-import { persistConversationIfNeeded } from "./chat/persist-conversation";
+import { persistConversationIfNeeded, shouldSaveTurn } from "./chat/persist-conversation";
 import {
   initializeSession,
   logMessageToSession,
@@ -675,7 +675,12 @@ export class ChatServiceImpl implements ChatService {
           }
 
           // A failed turn that kept its work is saved too, so it survives a restart.
-          if (!lastTurnErrored || failedTurnMessages !== undefined) {
+          if (
+            shouldSaveTurn({
+              lastTurnErrored,
+              turnKeptFailedWork: failedTurnMessages !== undefined,
+            })
+          ) {
             yield* persistConversationIfNeeded({
               ephemeral,
               conversationHistory,

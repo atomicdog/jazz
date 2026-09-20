@@ -568,7 +568,7 @@ function reportFailedTurn(
   }
   return Effect.sync(() => {
     const transcript: Pick<LoopState, "currentMessages"> = {
-      currentMessages: [state.currentMessages[0], ...state.currentMessages.slice(1)],
+      currentMessages: [...state.currentMessages],
     };
     closeDanglingToolCalls(transcript, FAILED_TURN_TOOL_RESULT);
     onFailedTurn(transcript.currentMessages);
